@@ -23,11 +23,13 @@ class Persona:
     attributes: dict = field(default_factory=dict)
     summary: str = ""
     fingerprint: dict = field(default_factory=dict)
-    metadata: dict = field(default_factory=dict)
-    selected_prompts: list = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)       # full raw metadata dict from refined profile
+    selected_prompts: list = field(default_factory=list)  # [{prompt_id, original, rewritten, cluster, score}]
+
     def domain(self)    -> list: return self.fingerprint.get("domain", ["general"])
     def register(self)  -> str:  return self.fingerprint.get("register", "casual")
     def expertise(self) -> str:  return self.fingerprint.get("expertise_level", "mid")
+
     @property
     def refined_summary(self) -> str:
         return self.metadata.get("refined_summary", "") or self.summary

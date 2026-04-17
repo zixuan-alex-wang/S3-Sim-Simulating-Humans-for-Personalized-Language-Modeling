@@ -1,8 +1,8 @@
 """Select and refine prompts for each US persona profile.
 Usage:
-    uv run python utils/select_and_refine_us_prompts.py
-    uv run python utils/select_and_refine_us_prompts.py --force
-    uv run python utils/select_and_refine_us_prompts.py --sample-size 120
+    uv run python scripts/select_and_refine_prompts.py
+    uv run python scripts/select_and_refine_prompts.py --force
+    uv run python scripts/select_and_refine_prompts.py --sample-size 120
 """
 from __future__ import annotations
 import argparse

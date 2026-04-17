@@ -1,0 +1,245 @@
+"""Rollout deeply-personal conversations from per-persona scenarios.
+
+Instead of reusing prompts from an existing dataset (see run_rollout.py), this
+script constructs scenarios on-the-fly with the
+`simulator_lifelong_scenario_constructor` prompt for each persona, then rolls
+out a conversation per scenario.
+
+Scenarios are cached per persona at data/deep_scenarios/{persona_id}.json so
+reruns skip the construction step.
+
+Usage:
+    uv run python run_deep_scenario_rollout.py
+    uv run python run_deep_scenario_rollout.py --ablation full --concurrency 40
+    uv run python run_deep_scenario_rollout.py --persona-ids profile_259 --max-scenarios 5
+"""
+import argparse, asyncio, json, logging
+from pathlib import Path
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+ROOT = Path(__file__).resolve().parent
+PROFILES_DIR = ROOT / "data" / "refined_profiles" / "US"
+SCENARIOS_DIR = ROOT / "data" / "deep_scenarios"
+
+
+async def construct_scenarios(persona, llm, constructor_tmpl: str) -> list[dict]:
+    """Call the scenario constructor LLM for one persona, return list of scenarios.
+
+    Each scenario: {scenario_id, context_note, category, initial_prompt}.
+    """
+    from user_simulator.prompts import render
+
+    profile_summary = persona.refined_summary or persona.summary
+    behavior_metadata = json.dumps(persona.behavioral_metadata, indent=2,
+                                   ensure_ascii=False) if persona.behavioral_metadata else "N/A"
+
+    prompt = render(constructor_tmpl,
+                    profile_summary=profile_summary,
+                    behavior_metadata=behavior_metadata,
+                    persona_id=persona.id)
+
+    data = await llm.chat_json(
+        [{"role": "system", "content": prompt},
+         {"role": "user", "content": "Generate the scenarios JSON now."}],
+        temperature=0.8, max_tokens=4096,
+    )
+    scenarios = data.get("scenarios", []) if isinstance(data, dict) else []
+    # Normalize ids in case the model didn't substitute {persona_id}
+    for i, s in enumerate(scenarios):
+        s.setdefault("scenario_id", f"{persona.id}_scenario_{i}")
+        s["scenario_id"] = s["scenario_id"].replace("{persona_id}", persona.id)
+    return scenarios
+
+
+async def get_or_build_scenarios(persona, llm, constructor_tmpl: str,
+                                 cache_dir: Path, force: bool = False) -> list[dict]:
+    cache_path = cache_dir / f"{persona.id}.json"
+    if cache_path.exists() and not force:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+    scenarios = await construct_scenarios(persona, llm, constructor_tmpl)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(scenarios, indent=2, ensure_ascii=False),
+                          encoding="utf-8")
+    logger.info("Constructed %d scenarios for %s", len(scenarios), persona.id)
+    return scenarios
+
+
+async def main(ablation: str, concurrency: int, max_turns: int, min_turns: int,
+               persona_ids: list[str] | None, max_scenarios: int | None,
+               output_dir: str | None, constructor: str,
+               force_reconstruct: bool):
+    from user_simulator.data import LLM, SIM_MODEL, load_personas, save_json, CONV_DIR, SFT_DIR
+    from user_simulator.ablation import AblationConfig
+    from user_simulator.simulator import rollout_conversation
+    from user_simulator.oracle import build_sft_system_prompt
+    from user_simulator.prompts import load_prompt
+
+    config = AblationConfig.from_name(ablation)
+    if output_dir:
+        CONV_DIR = Path(output_dir) / "conversations"
+        SFT_DIR = Path(output_dir) / "sft"
+
+    constructor_tmpl = load_prompt(constructor)
+
+    personas_list = load_personas(PROFILES_DIR)
+    if persona_ids:
+        id_set = set(persona_ids)
+        personas_list = [p for p in personas_list if p.id in id_set]
+    logger.info("Processing %d personas", len(personas_list))
+
+    llm = LLM(model=SIM_MODEL, max_concurrent=concurrency)
+
+    run_tag = f"deep_{config.name}"
+    conv_dir = CONV_DIR / run_tag
+    conv_dir.mkdir(parents=True, exist_ok=True)
+    sft_path = SFT_DIR / f"train_{run_tag}.jsonl"
+    sft_path.parent.mkdir(parents=True, exist_ok=True)
+    sft_lock = asyncio.Lock()
+
+    # ── Phase 1: construct scenarios for all personas in parallel ──
+    logger.info("Phase 1: constructing scenarios (cache: %s)", SCENARIOS_DIR)
+    scenario_tasks = [
+        get_or_build_scenarios(p, llm, constructor_tmpl, SCENARIOS_DIR,
+                               force=force_reconstruct)
+        for p in personas_list
+    ]
+    all_scenarios_by_persona = await asyncio.gather(*scenario_tasks)
+
+    # Build flat rollout spec
+    tasks_spec = []
+    for persona, scenarios in zip(personas_list, all_scenarios_by_persona):
+        if max_scenarios:
+            scenarios = scenarios[:max_scenarios]
+        for s in scenarios:
+            tasks_spec.append((persona, s))
+
+    logger.info("Phase 2 [%s]: %d rollouts, concurrency=%d, %d-%d turns",
+                config.name, len(tasks_spec), concurrency, min_turns, max_turns)
+
+    counter = {"done": 0, "skipped": 0, "failed": 0, "total": len(tasks_spec)}
+
+    def _build_sft_instance(session: dict) -> dict | None:
+        conversation = session.get("conversation", [])
+        if not conversation:
+            return None
+        system_msg = build_sft_system_prompt(
+            profile_summary=session.get("profile_summary", ""),
+            behavior_metadata=json.dumps(session.get("behavioral_metadata", {}),
+                                         indent=2, ensure_ascii=False)
+                if session.get("behavioral_metadata") else "",
+            include_profile=config.sft_include_profile,
+        )
+        messages = [{"role": "system", "content": system_msg}]
+        for msg in conversation:
+            if msg["role"] in ("user", "assistant"):
+                messages.append({"role": msg["role"], "content": msg["content"]})
+        return {
+            "messages": messages,
+            "metadata": {
+                "persona_id": session.get("persona_id", ""),
+                "scenario_id": session.get("prompt_id", ""),
+                "scenario_category": session.get("scenario_category", ""),
+                "num_turns": session.get("num_turns", 0),
+                "termination": session.get("termination", ""),
+                "ablation": config.name,
+                "source": "deep_scenario",
+            },
+        }
+
+    async def rollout_one(persona, scenario, sft_file):
+        scenario_id = scenario.get("scenario_id", "unknown")
+        initial_msg = scenario.get("initial_prompt", "")
+        if not initial_msg:
+            counter["skipped"] += 1
+            return
+
+        safe_id = scenario_id.replace("/", "_").replace("\\", "_")
+        conv_path = conv_dir / persona.id / f"{safe_id}.json"
+        if conv_path.exists():
+            counter["skipped"] += 1
+            return
+
+        try:
+            session = await rollout_conversation(
+                persona, initial_msg, scenario_id,
+                llm, max_turns=max_turns, min_turns=min_turns,
+                config=config,
+            )
+            session["profile_summary"] = persona.refined_summary
+            session["behavioral_metadata"] = persona.behavioral_metadata
+            session["scenario_category"] = scenario.get("category", "")
+            session["scenario_context_note"] = scenario.get("context_note", "")
+            session["initial_prompt"] = initial_msg
+
+            conv_path.parent.mkdir(parents=True, exist_ok=True)
+            save_json(session, conv_path)
+
+            sft_instance = _build_sft_instance(session)
+            if sft_instance:
+                async with sft_lock:
+                    sft_file.write(json.dumps(sft_instance, ensure_ascii=False) + "\n")
+                    sft_file.flush()
+
+            counter["done"] += 1
+            done = counter["done"]
+            if done % 10 == 0 or done == counter["total"]:
+                logger.info("[%s] Progress: %d/%d done, %d skipped, %d failed",
+                            run_tag, done, counter["total"],
+                            counter["skipped"], counter["failed"])
+        except Exception as e:
+            counter["failed"] += 1
+            logger.error("[%s/%s] Failed %s: %s", run_tag, persona.id, safe_id, e)
+
+    sem = asyncio.Semaphore(concurrency)
+
+    # Append, not truncate — resumable across runs
+    with open(sft_path, "a", encoding="utf-8") as sft_file:
+        async def bounded(persona, scenario):
+            async with sem:
+                await rollout_one(persona, scenario, sft_file)
+
+        await asyncio.gather(*[
+            bounded(persona, scenario)
+            for persona, scenario in tasks_spec
+        ])
+
+    logger.info("[%s] Complete: %d done, %d skipped, %d failed (of %d total)",
+                run_tag, counter["done"], counter["skipped"],
+                counter["failed"], counter["total"])
+    logger.info("[%s] Conversations → %s", run_tag, conv_dir)
+    logger.info("[%s] SFT data → %s", run_tag, sft_path)
+    logger.info("LLM stats: %s", llm.stats)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Rollout deep scenario-seeded conversations")
+    parser.add_argument("--ablation", type=str, default="full",
+                        choices=["full", "no_privilege", "no_behavior", "no_state",
+                                 "oracle_profile_only"])
+    parser.add_argument("--concurrency", type=int, default=40)
+    parser.add_argument("--max-turns", type=int, default=12)
+    parser.add_argument("--min-turns", type=int, default=3)
+    parser.add_argument("--persona-ids", nargs="*", help="Filter to specific persona IDs")
+    parser.add_argument("--max-scenarios", type=int, default=None,
+                        help="Cap scenarios per persona (default: use all constructed)")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Custom output directory (default: output/)")
+    parser.add_argument("--constructor", type=str, default="simulator_lifelong_scenario_constructor",
+                        help="Scenario constructor prompt name under user_simulator/prompts/")
+    parser.add_argument("--force-reconstruct", action="store_true",
+                        help="Regenerate scenarios even if cached")
+    args = parser.parse_args()
+
+    asyncio.run(main(
+        ablation=args.ablation,
+        concurrency=args.concurrency,
+        max_turns=args.max_turns,
+        min_turns=args.min_turns,
+        persona_ids=args.persona_ids,
+        max_scenarios=args.max_scenarios,
+        output_dir=args.output_dir,
+        constructor=args.constructor,
+        force_reconstruct=args.force_reconstruct,
+    ))

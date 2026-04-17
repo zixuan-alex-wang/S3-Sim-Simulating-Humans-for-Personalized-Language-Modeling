@@ -1,4 +1,7 @@
-"""Data generation pipeline: rollout conversations with integrated assistant strategy. No separate oracle annotation step — the assistant strategy (oracle/vanilla) is applied directly during rollout. Results are streamed to disk as they complete.
+"""Data generation pipeline: rollout conversations with integrated assistant strategy.
+No separate oracle annotation step — the assistant strategy (oracle/vanilla) is
+applied directly during rollout. Results are streamed to disk as they complete.
+Usage:
     uv run python -m user_simulator.pipeline --ablation full
     uv run python -m user_simulator.pipeline --ablation full --persona-ids profile_419 --max-prompts 2
     uv run python -m user_simulator.pipeline --ablation full --concurrency 80
@@ -12,23 +15,31 @@ from user_simulator.data import (
 from user_simulator.ablation import AblationConfig
 from user_simulator.simulator import rollout_conversation
 from user_simulator.oracle import build_sft_system_prompt
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
 DEFAULT_PROFILES_DIR = DATA_DIR / "refined_profiles" / "US"
+
+
 async def rollout_one(persona: Persona, prompt_data: dict, prompt_idx: int,
                       llm: LLM, config: AblationConfig,
                       conv_dir: Path, sft_file, sft_lock: asyncio.Lock,
                       max_turns: int, min_turns: int,
                       counter: dict):
+    """Rollout a single conversation and stream-write the SFT instance."""
     prompt_id = prompt_data.get("prompt_id", f"prompt_{prompt_idx}")
     initial_msg = prompt_data.get("rewritten") or prompt_data.get("original", "")
     if not initial_msg:
         return
+
     safe_id = prompt_id.replace("/", "_").replace("\\", "_")
     conv_path = conv_dir / persona.id / f"{safe_id}.json"
+
     if conv_path.exists():
         counter["skipped"] += 1
         return
+
     try:
         session = await rollout_conversation(
             persona, initial_msg, prompt_id,
@@ -38,13 +49,18 @@ async def rollout_one(persona: Persona, prompt_data: dict, prompt_idx: int,
         session["profile_summary"] = persona.refined_summary
         session["behavioral_metadata"] = persona.behavioral_metadata
         session["scenario_category"] = prompt_data.get("cluster", "selected")
+
+        # Save raw conversation JSON
         conv_path.parent.mkdir(parents=True, exist_ok=True)
         save_json(session, conv_path)
+
+        # Build SFT instance and stream-write
         sft_instance = _build_sft_instance(session, config)
         if sft_instance:
             async with sft_lock:
                 sft_file.write(json.dumps(sft_instance, ensure_ascii=False) + "\n")
                 sft_file.flush()
+
         counter["done"] += 1
         total = counter["total"]
         done = counter["done"]
@@ -58,6 +74,7 @@ async def rollout_one(persona: Persona, prompt_data: dict, prompt_idx: int,
 
 
 def _build_sft_instance(session: dict, config: AblationConfig) -> dict | None:
+    """Build a TRL multi-turn SFT instance from a completed session."""
     conversation = session.get("conversation", [])
     if not conversation:
         return None
@@ -100,6 +117,8 @@ async def run(profiles_dir: Path = None, persona_ids: list[str] | None = None,
         id_set = set(persona_ids)
         personas = [p for p in personas if p.id in id_set]
     personas = [p for p in personas if p.selected_prompts]
+
+    # Build all (persona, prompt) tasks
     tasks_spec = []
     for persona in personas:
         prompts = persona.selected_prompts[:max_prompts] if max_prompts else persona.selected_prompts
@@ -112,12 +131,17 @@ async def run(profiles_dir: Path = None, persona_ids: list[str] | None = None,
     llm = LLM(model=SIM_MODEL, max_concurrent=concurrency)
     conv_dir = CONV_DIR / config.name
     conv_dir.mkdir(parents=True, exist_ok=True)
+
+    # Streaming SFT output
     sft_path = SFT_DIR / f"train_{config.name}.jsonl"
     sft_path.parent.mkdir(parents=True, exist_ok=True)
     sft_lock = asyncio.Lock()
+
     counter = {"done": 0, "skipped": 0, "failed": 0, "total": len(tasks_spec)}
 
+    # Open SFT file for streaming writes
     with open(sft_path, "w", encoding="utf-8") as sft_file:
+        # Launch all tasks with semaphore-controlled concurrency
         sem = asyncio.Semaphore(concurrency)
 
         async def bounded(persona, prompt_data, idx):
